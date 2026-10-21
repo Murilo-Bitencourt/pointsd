@@ -31,9 +31,8 @@ type Entry struct {
 var ErrUnavailable = errors.New("ledger: unavailable")
 
 type Store interface {
-	HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error)
-	AwardedInMonth(ctx context.Context, memberID, month string) (int64, error)
-	Append(ctx context.Context, e Entry) error
+	TryAward(ctx context.Context, e Entry, monthlyCap int64) (int64, error)
+	TryReverse(ctx context.Context, paymentID, memberID string) (bool, error)
 	Balance(ctx context.Context, memberID string) (int64, error)
 }
 
@@ -51,15 +50,16 @@ func WithFaults(f func(op string) error) Option {
 }
 
 type MemoryStore struct {
-	latency time.Duration
-	faults  func(op string) error
+	latency  time.Duration
+	faults   func(op string) error
 
-	mu      sync.Mutex
-	entries []Entry
+	mu       sync.Mutex
+	entries  []Entry
+	memberMu map[string]*sync.Mutex
 }
 
 func NewMemoryStore(opts ...Option) *MemoryStore {
-	s := &MemoryStore{}
+	s := &MemoryStore{memberMu: make(map[string]*sync.Mutex)}
 	for _, o := range opts {
 		o(s)
 	}
@@ -80,33 +80,85 @@ func (s *MemoryStore) roundTrip(ctx context.Context, op string) error {
 	return nil
 }
 
-func (s *MemoryStore) HasEntry(ctx context.Context, paymentID string, kind Kind) (bool, error) {
-	if err := s.roundTrip(ctx, "has_entry"); err != nil {
-		return false, err
-	}
+func (s *MemoryStore) memberLock(memberID string) *sync.Mutex {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, e := range s.entries {
-		if e.PaymentID == paymentID && e.Kind == kind {
+	if _, ok := s.memberMu[memberID]; !ok {
+		s.memberMu[memberID] = &sync.Mutex{}
+	}
+	return s.memberMu[memberID]
+}
+
+func (s *MemoryStore) TryAward(ctx context.Context, e Entry, monthlyCap int64) (int64, error) {
+	if err := s.roundTrip(ctx, "try_award"); err != nil {
+		return 0, err
+	}
+
+	ml := s.memberLock(e.MemberID)
+	ml.Lock()
+	defer ml.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, ex := range s.entries {
+		if ex.PaymentID == e.PaymentID && ex.Kind == KindAward {
+			return 0, nil
+		}
+	}
+
+	var used int64
+	for _, ex := range s.entries {
+		if ex.MemberID == e.MemberID && ex.Month == e.Month && ex.Kind == KindAward {
+			used += ex.Points
+		}
+	}
+	if room := monthlyCap - used; e.Points > room {
+		e.Points = max(room, 0)
+	}
+	s.entries = append(s.entries, e)
+	return e.Points, nil
+}
+
+func (s *MemoryStore) TryReverse(ctx context.Context, paymentID, memberID string) (bool, error) {
+	if err := s.roundTrip(ctx, "try_reverse"); err != nil {
+		return false, err
+	}
+
+	ml := s.memberLock(memberID)
+	ml.Lock()
+	defer ml.Unlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var award Entry
+	var found bool
+	for _, ex := range s.entries {
+		if ex.PaymentID == paymentID && ex.Kind == KindAward {
+			award = ex
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false, nil
+	}
+
+	for _, ex := range s.entries {
+		if ex.PaymentID == paymentID && ex.Kind == KindReversal {
 			return true, nil
 		}
 	}
-	return false, nil
-}
 
-func (s *MemoryStore) AwardedInMonth(ctx context.Context, memberID, month string) (int64, error) {
-	if err := s.roundTrip(ctx, "awarded_in_month"); err != nil {
-		return 0, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var total int64
-	for _, e := range s.entries {
-		if e.MemberID == memberID && e.Month == month && e.Kind == KindAward {
-			total += e.Points
-		}
-	}
-	return total, nil
+	s.entries = append(s.entries, Entry{
+		MemberID:  memberID,
+		PaymentID: paymentID,
+		Kind:      KindReversal,
+		Points:    -award.Points,
+		Month:     award.Month,
+	})
+	return true, nil
 }
 
 func (s *MemoryStore) Append(ctx context.Context, e Entry) error {

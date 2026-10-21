@@ -41,7 +41,16 @@ func (h *Handler) Handle(ctx context.Context, msg pubsub.Message) {
 	}
 
 	if err := h.process(ctx, ev); err != nil {
-		h.log.Error("processing failed", "payment_id", ev.PaymentID, "type", ev.Type, "err", err)
+		if errors.Is(err, ledger.ErrUnavailable) {
+			h.log.Error("processing failed", "payment_id", ev.PaymentID, "type", ev.Type, "err", err)
+			msg.Nack()
+			return
+		}
+		if errors.Is(err, ErrUnknownPayment) {
+			h.log.Warn("reversal for unknown payment", "payment_id", ev.PaymentID)
+		} else {
+			h.log.Error("processing failed", "payment_id", ev.PaymentID, "type", ev.Type, "err", err)
+		}
 	}
 	msg.Ack()
 }
@@ -57,54 +66,23 @@ func (h *Handler) process(ctx context.Context, ev events.Payment) error {
 }
 
 func (h *Handler) award(ctx context.Context, ev events.Payment) error {
-	seen, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindAward)
-	if err != nil {
-		return err
-	}
-	if seen {
-		return nil
-	}
-
-	month := Month(ev.OccurredAt)
-	used, err := h.store.AwardedInMonth(ctx, ev.MemberID, month)
-	if err != nil {
-		return err
-	}
-	points := h.policy.Points(ev.AmountCents)
-	if room := h.policy.MonthlyCap - used; points > room {
-		points = max(room, 0)
-	}
-
-	return h.store.Append(ctx, ledger.Entry{
+	_, err := h.store.TryAward(ctx, ledger.Entry{
 		MemberID:  ev.MemberID,
 		PaymentID: ev.PaymentID,
 		Kind:      ledger.KindAward,
-		Points:    points,
-		Month:     month,
-	})
+		Points:    h.policy.Points(ev.AmountCents),
+		Month:     Month(ev.OccurredAt),
+	}, h.policy.MonthlyCap)
+	return err
 }
 
 func (h *Handler) reverse(ctx context.Context, ev events.Payment) error {
-	awarded, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindAward)
+	ok, err := h.store.TryReverse(ctx, ev.PaymentID, ev.MemberID)
 	if err != nil {
 		return err
 	}
-	if !awarded {
+	if !ok {
 		return ErrUnknownPayment
 	}
-	done, err := h.store.HasEntry(ctx, ev.PaymentID, ledger.KindReversal)
-	if err != nil {
-		return err
-	}
-	if done {
-		return nil
-	}
-
-	return h.store.Append(ctx, ledger.Entry{
-		MemberID:  ev.MemberID,
-		PaymentID: ev.PaymentID,
-		Kind:      ledger.KindReversal,
-		Points:    -h.policy.Points(ev.AmountCents),
-		Month:     Month(ev.OccurredAt),
-	})
+	return nil
 }
